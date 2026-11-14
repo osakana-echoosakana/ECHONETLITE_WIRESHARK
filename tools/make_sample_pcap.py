@@ -115,6 +115,12 @@ def main(path):
         (DEV, CTRL, el(9, "028801", "05FF01", 0x74,
                        [(0xEA, struct.pack("!HBBBBBI", 2026, 11, 14, 18, 30, 0, 123500))])),
         (CTRL, DEV, el(9, "05FF01", "028801", 0x7A, [(0xEA, b"")])),
+        # 12b. Bitmap / array properties (AC air purification method, meter history)
+        (CTRL, DEV, el(11, "05FF01", "013001", 0x62, [(0xC6, b"")])),
+        (DEV, CTRL, el(11, "013001", "05FF01", 0x72, [(0xC6, b"\x03")])),
+        (DEV, CTRL, el(12, "028801", "05FF01", 0x72,
+                       [(0xE2, struct.pack("!H", 1) + b"".join(struct.pack("!I", 1000 + i) for i in range(47))
+                         + b"\xFF\xFF\xFF\xFE")])),
         # 13. Arbitrary message format
         (CTRL, DEV, bytes([0x10, 0x82, 0x00, 0x0A]) + b"hello"),
         # 14. Truncated frame
