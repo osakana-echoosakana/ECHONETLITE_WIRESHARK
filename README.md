@@ -21,6 +21,22 @@ Info 列には `Get_Res 013001 -> 05FF01 TID=4 EPC[80,B0,B3]` のように要約
 
 ## インストール
 
+### Windows（インストーラー）
+
+1. [Releases](https://github.com/osakana-echoosakana/ECHONETLITE_WIRESHARK/releases) から
+   `echonet-lite-wireshark-setup-<バージョン>.exe` をダウンロードして実行します。
+   管理者権限は不要です。
+2. `echonet_lite.lua` が `%APPDATA%\Wireshark\plugins\` にコピーされます。
+3. Wireshark を再起動します（起動中なら **解析 → Lua プラグインを再読み込み**、`Ctrl+Shift+L` でも可）。
+
+アンインストールは「設定 → アプリ」（または「プログラムと機能」）の
+「ECHONET Lite Wireshark Dissector」から行えます。サイレントインストールは `/S` を付けて実行します。
+
+> 署名していない exe のため、初回実行時に Windows SmartScreen の警告が出ることがあります。
+> 「詳細情報 → 実行」で続行してください。
+
+### 手動インストール（Windows / macOS / Linux）
+
 1. `echonet_lite.lua` をダウンロードします。
 2. Wireshark を起動し、**ヘルプ → Wireshark について → フォルダ** タブを開き、
    「**個人 Lua プラグイン**（Personal Lua Plugins）」のパスを確認します。代表的な場所は次の通りです。
@@ -78,6 +94,19 @@ tshark -X lua_script:echonet_lite.lua -r samples/echonet_lite_sample.pcap -O ech
 ```
 
 Wireshark 4.2.2 (Lua 5.2) で動作確認済みです。Wireshark 3.x 以降であれば動作する想定です。
+
+## インストーラーのビルド
+
+`installer/echonet_lite_installer.nsi`（NSIS 3）から作成します。Linux でもビルドできます。
+
+```sh
+sudo apt-get install nsis
+makensis -DVERSION=1.0.0 installer/echonet_lite_installer.nsi   # dist/ に exe が出力されます
+```
+
+GitHub Actions（`.github/workflows/build-installer.yml`）が push・PR ごとに exe をビルドし、
+Artifacts に保存します。`v1.0.0` のようなタグを push すると、exe と `echonet_lite.lua` を添付した
+Release が自動で作成されます。
 
 ## 拡張方法
 
