@@ -3,6 +3,13 @@
 Wireshark / tshark で ECHONET Lite の電文を解析するための Lua プラグインです。
 ビルド不要で、ファイルを 1 つコピーするだけで使えます。
 
+エコーネットコンソーシアムが公開している **Machine Readable Appendix（MRA）** を所定のフォルダに置くと、
+起動時に読み込み、APPENDIX「ECHONET 機器オブジェクト詳細規定」**Release A〜R** のクラス名・プロパティ名・
+値の意味を表示します。表示は**日本語（既定）と英語**を切り替えられます。
+
+> MRA はこのプラグインやインストーラーには**含まれていません**。各自でエコーネットコンソーシアムから入手してください
+> （[MRA の配置](#mra-の配置)）。MRA が無い場合は、内蔵の簡易表（主要なクラス名・プロパティ名）で表示します。
+
 ## 対応内容
 
 | 項目 | 内容 |
@@ -12,9 +19,13 @@ Wireshark / tshark で ECHONET Lite の電文を解析するための Lua プラ
 | EOJ | SEOJ / DEOJ をクラスグループ・クラス・インスタンスに分解し、クラス名を表示 |
 | ESV | 全 ESV（SetI, SetC, Get, INF_REQ, SetGet, 各 _Res, INF, INFC, INFC_Res, 各 _SNA）を名称付きで表示 |
 | SetGet | SetGet / SetGet_Res / SetGet_SNA の OPCSet・OPCGet 2 区画を個別に解析 |
-| プロパティ | OPC / EPC / PDC / EDT。EPC 名称はクラスごとの表 → スーパークラスの順で引く |
-| 値の解釈 | 動作状態(0x80)、設置場所(0x81)、規格Version(0x82)、異常発生状態(0x88)、メーカコード(0x8A)、プロパティマップ(0x9D/0x9E/0x9F、リスト形式・ビットマップ形式とも)、インスタンスリスト(0xD5/0xD6)、クラスリスト(0xD7)、瞬時電力/積算電力(0x84/0x85) ほか |
-| クラス固有 | 家庭用エアコン、温度/湿度/照度/CO2/人体検知センサ、住宅用太陽光発電、蓄電池、EV充放電器、低圧スマート電力量メータ、一般照明、電気錠、電気温水器 などの主要 EPC |
+| プロパティ | OPC / EPC / PDC / EDT。EPC 名称はクラス固有 → スーパークラスの順で引く |
+| MRA 読み込み時 | MRA に定義されている全クラス・全プロパティ（MRA v1.3.1 では機器オブジェクト 55 クラス、ノードプロファイル、スーパークラスの計 982 定義）の名称を表示 |
+| 値の解釈（MRA 読み込み時） | MRA のデータ定義（数値と単位・倍率、状態値、レベル、ビットマップ、構造体、配列、日時など）に従って EDT を解釈。「未計測」などの特殊値、オーバーフロー/アンダーフロー、範囲外、係数プロパティの参照先も表示 |
+| 値の解釈（MRA なし） | 動作状態、異常発生状態、エアコンの運転モード・温度、スマートメータの電力・電流など主要なプロパティのみ |
+| 個別処理 | プロパティマップ(0x9B〜0x9F、リスト形式・ビットマップ形式とも)、インスタンスリスト(0xD5/0xD6)、クラスリスト(0xD7)、Version 情報(0x82)、設置場所(0x81) |
+| Release 情報（MRA 読み込み時） | 各プロパティの定義がどの Release から有効か（例: `定義: Release D〜`）を表示。Release によって定義が異なるプロパティは、設定で選んだ Release の定義で解釈 |
+| 表示言語 | 日本語（既定）/ 英語。クラス名・プロパティ名・値・ESV の説明が切り替わります |
 | エキスパート情報 | 短すぎるフレーム、PDC と実データの不一致、未知の ESV、末尾の余剰バイト、SNA 応答 |
 
 Info 列には `Get_Res 013001 -> 05FF01 TID=4 EPC[80,B0,B3]` のように要約が表示されます。
@@ -56,6 +67,18 @@ tshark -X lua_script:echonet_lite.lua -r capture.pcap
 > 個人 Lua スクリプトが読み込まれません。一般ユーザで実行してください
 > （キャプチャ権限は `wireshark` グループ等で付与）。
 
+## MRA の配置
+
+1. エコーネットコンソーシアムの Web サイト（https://echonet.jp/ の規格書のページ）から
+   「Machine Readable Appendix」をダウンロードし、利用条件を確認のうえ展開します。
+2. 展開したフォルダ（`metaData.json`、`definitions`、`devices`、`superClass`、`nodeProfile` が入っているフォルダ。
+   その親の `mraData` を含むフォルダでも可）を、次のどちらかに `echonet_mra` という名前で置きます。
+   - 個人設定フォルダ: Windows は `%APPDATA%\Wireshark\echonet_mra`、macOS / Linux は `~/.config/wireshark/echonet_mra`
+   - 個人 Lua プラグインフォルダ: `%APPDATA%\Wireshark\plugins\echonet_mra` など
+   - 別の場所に置く場合は、設定の **MRA folder** にそのパスを指定します
+3. Wireshark を再起動します。パケット詳細の先頭に `[MRA 1.3.1 (Release R), 56 classes: …]` と出ていれば読み込めています。
+   見つからない場合は `[MRA not found (searched: …) - 内蔵の簡易表で表示しています]` と探した場所が表示されます。
+
 ## 使い方
 
 - キャプチャフィルタ例: `udp port 3610`
@@ -75,6 +98,10 @@ tshark -X lua_script:echonet_lite.lua -r capture.pcap
 
 **編集 → 設定 → Protocols → ECHONET Lite** で以下を変更できます。
 
+- **Language / 表示言語**: 日本語（既定）または English
+- **MRA folder**: MRA を置いたフォルダ（空欄なら上記の既定の場所を探します）
+- **APPENDIX Release**: プロパティ定義を選ぶ基準の Release（既定「Latest (最新)」= MRA の最新）。
+  機器が古い Release に準拠している場合に、その Release を選ぶと当時の定義で解釈します
 - **UDP port**: 既定 3610
 - **Heuristic detection on other UDP ports**: 3610 以外のポートでも EHD1=0x10 / EHD2=0x81・0x82 のパケットを自動検出（既定 OFF）
 
@@ -83,14 +110,17 @@ tshark -X lua_script:echonet_lite.lua -r capture.pcap
 
 ## サンプルとテスト
 
-- `samples/echonet_lite_sample.pcap`: 動作確認用のサンプル（22 フレーム）。
+- `samples/echonet_lite_sample.pcap`: 動作確認用のサンプル（25 フレーム）。
   ノード探索、インスタンスリスト通知、プロパティマップ（リスト／ビットマップ）、エアコンの状態取得、
-  SetC、SetGet、Get_SNA、スマートメータ、INFC/INFC_Res、形式2、壊れたフレームを含みます。
+  SetC、SetGet、Get_SNA、スマートメータ（積算電力量履歴の配列を含む）、ビットマップ型プロパティ、
+  INFC/INFC_Res、形式2、壊れたフレームを含みます。
 - `tools/make_sample_pcap.py`: 上記サンプルを生成する Python スクリプト（外部ライブラリ不要）。
 
 ```sh
 python3 tools/make_sample_pcap.py samples/echonet_lite_sample.pcap
 tshark -X lua_script:echonet_lite.lua -r samples/echonet_lite_sample.pcap -O echonetlite
+# 英語表示・Release を指定する場合
+tshark -X lua_script:echonet_lite.lua -o echonetlite.language:English -o "echonetlite.release:Release J" -r samples/echonet_lite_sample.pcap -O echonetlite
 ```
 
 Wireshark 4.2.2 (Lua 5.2) で動作確認済みです。Wireshark 3.x 以降であれば動作する想定です。
@@ -110,21 +140,23 @@ Release が自動で作成されます。
 
 ## 拡張方法
 
-名称や値の解釈は `echonet_lite.lua` 内の表で管理しています。
+- 内蔵のクラス名: `BUILTIN_CLASS_NAMES` に `[0xGGCC] = { ja = "名称", en = "Name" }`
+- 個別の値の解釈: `decode_special()` に条件を追加（MRA による汎用解釈より優先されます）
+- MRA が新しくなった場合は、新しい MRA を `echonet_mra` フォルダに置き換えるだけで反映されます
 
-- クラス名を追加: `CLASS_NAMES` に `[0xGGCC] = "名称"`
-- クラス固有 EPC 名を追加: `CLASS_EPC_NAMES[0xGGCC]` に `[0xEP] = "名称"`
-- 値の解釈を追加: `decode_value()` 内に条件を追加
-
-名称は ECHONET Lite 規格書および APPENDIX「ECHONET 機器オブジェクト詳細規定」の英語表記に準じています。
-収録していないクラスや EPC は「Unknown」と表示され、EDT は 16 進数で表示されます。
+収録していない EPC は「不明」と表示され、EDT は 16 進数で表示されます。
 
 ## 制限事項
 
 - TCP 上の ECHONET Lite は未対応です（ヘッダに長さが無いため、1 セグメント 1 電文の前提でも誤判定しやすいため）。
-- クラス・EPC の名称は主要なもののみ収録しています。全クラスの網羅はしていません。
+- MRA（v1.3.1）に定義があるのは機器オブジェクト 55 クラスです。それ以外のクラスは
+  内蔵のクラス名のみ表示し、プロパティはスーパークラス（0x80〜0x9F）の定義だけで解釈します。
+  内蔵のクラス名・クラス固有プロパティ名の日本語表記は一部のみで、未収録のものは英語で表示します。
+- 機器が準拠する Release を電文から自動判定することはしていません（設定で指定します）。
 - 形式2（任意電文形式）はペイロードを 16 進表示するのみです。
 
 ## ライセンス
 
 MIT
+
+MRA はこのリポジトリに含まれていません。MRA の利用条件はエコーネットコンソーシアムの定めに従ってください。

@@ -5,8 +5,12 @@
   - EHD1 / EHD2 / TID
   - SEOJ / DEOJ (class group / class / instance, with names)
   - ESV (with names), including the two OPC sections of SetGet / SetGet_Res / SetGet_SNA
-  - OPC / EPC / PDC / EDT, with names for common EPCs and decoding of
-    common values (operation status, property maps, instance lists, ...)
+  - OPC / EPC / PDC / EDT with names and decoded values.
+    When the ECHONET Consortium's Machine Readable Appendix (MRA) is installed
+    (see below), property names and value definitions of APPENDIX Release A .. R
+    are read from it at start-up. The MRA itself is not bundled with this plugin.
+    Without the MRA, built-in tables with the most common names are used.
+  - Japanese / English display (Preferences > Protocols > ECHONET Lite)
 
   Install: copy this file into Wireshark's personal Lua plugins folder
   (Help > About Wireshark > Folders > "Personal Lua Plugins") and restart.
@@ -14,7 +18,7 @@
   License: MIT
 ]]
 
-local PLUGIN_VERSION = "1.0.0"
+local PLUGIN_VERSION = "1.1.0"
 
 set_plugin_info({
     version     = PLUGIN_VERSION,
@@ -26,285 +30,567 @@ set_plugin_info({
 local el = Proto("echonetlite", "ECHONET Lite")
 
 ---------------------------------------------------------------------------
--- Value tables
+-- Machine Readable Appendix (MRA) loader
+--
+-- The MRA is NOT bundled with this plugin. Download it from the ECHONET
+-- Consortium web site, unpack it, and put it in one of these folders
+-- (or set "MRA folder" in Preferences > Protocols > ECHONET Lite):
+--   <Personal configuration folder>/echonet_mra
+--   <Personal Lua plugins folder>/echonet_mra
+-- The folder must contain metaData.json, definitions/, devices/,
+-- superClass/ and nodeProfile/ (a "mraData" sub-folder is also accepted).
 ---------------------------------------------------------------------------
 
-local EHD1_NAMES = {
-    [0x10] = "ECHONET Lite",
-}
+-- Minimal JSON decoder (objects -> tables, arrays -> sequences, null -> nil)
+local json_decode
+do
+    local function utf8_char(c)
+        if c < 0x80 then return string.char(c)
+        elseif c < 0x800 then
+            return string.char(0xC0 + math.floor(c / 0x40), 0x80 + c % 0x40)
+        elseif c < 0x10000 then
+            return string.char(0xE0 + math.floor(c / 0x1000), 0x80 + math.floor(c / 0x40) % 0x40, 0x80 + c % 0x40)
+        end
+        return string.char(0xF0 + math.floor(c / 0x40000), 0x80 + math.floor(c / 0x1000) % 0x40,
+                           0x80 + math.floor(c / 0x40) % 0x40, 0x80 + c % 0x40)
+    end
+    local ESC = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
 
+    json_decode = function(s)
+        local pos = 1
+        local function ws() pos = s:find("[^ \t\r\n]", pos) or (#s + 1) end
+        local function err(msg) error(string.format("JSON error at %d: %s", pos, msg), 0) end
+        local value
+        local function str()
+            pos = pos + 1
+            local buf = {}
+            while true do
+                local i = s:find('["\\]', pos)
+                if not i then err("unterminated string") end
+                buf[#buf + 1] = s:sub(pos, i - 1)
+                if s:sub(i, i) == '"' then pos = i + 1; break end
+                local e = s:sub(i + 1, i + 1)
+                if e == "u" then
+                    local c = tonumber(s:sub(i + 2, i + 5), 16) or 0x3F
+                    pos = i + 6
+                    if c >= 0xD800 and c <= 0xDBFF and s:sub(pos, pos + 1) == "\\u" then
+                        local lo = tonumber(s:sub(pos + 2, pos + 5), 16) or 0xDC00
+                        c = 0x10000 + (c - 0xD800) * 0x400 + (lo - 0xDC00)
+                        pos = pos + 6
+                    end
+                    buf[#buf + 1] = utf8_char(c)
+                else
+                    buf[#buf + 1] = ESC[e] or e
+                    pos = i + 2
+                end
+            end
+            return table.concat(buf)
+        end
+        value = function()
+            ws()
+            local c = s:sub(pos, pos)
+            if c == "{" then
+                local t = {}
+                pos = pos + 1; ws()
+                if s:sub(pos, pos) == "}" then pos = pos + 1; return t end
+                while true do
+                    ws()
+                    if s:sub(pos, pos) ~= '"' then err("expected key") end
+                    local k = str()
+                    ws()
+                    if s:sub(pos, pos) ~= ":" then err("expected ':'") end
+                    pos = pos + 1
+                    t[k] = value()
+                    ws()
+                    local d = s:sub(pos, pos); pos = pos + 1
+                    if d == "}" then return t end
+                    if d ~= "," then err("expected ',' or '}'") end
+                end
+            elseif c == "[" then
+                local t = {}
+                pos = pos + 1; ws()
+                if s:sub(pos, pos) == "]" then pos = pos + 1; return t end
+                while true do
+                    t[#t + 1] = value()
+                    ws()
+                    local d = s:sub(pos, pos); pos = pos + 1
+                    if d == "]" then return t end
+                    if d ~= "," then err("expected ',' or ']'") end
+                end
+            elseif c == '"' then
+                return str()
+            elseif s:sub(pos, pos + 3) == "true" then pos = pos + 4; return true
+            elseif s:sub(pos, pos + 4) == "false" then pos = pos + 5; return false
+            elseif s:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil
+            else
+                local num = s:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+                if not num or num == "" then err("unexpected character") end
+                pos = pos + #num
+                return tonumber(num)
+            end
+        end
+        local v = value()
+        return v
+    end
+end
+
+local MRA = nil          -- loaded MRA (nil = not loaded, built-in tables are used)
+local MRA_STATUS = ""    -- human readable load status
+local MRA_LOADED_FROM = nil
+
+local function read_file(path)
+    local fh = io.open(path, "rb")
+    if not fh then return nil end
+    local data = fh:read("*a")
+    fh:close()
+    return data
+end
+
+local function read_json(path)
+    local data = read_file(path)
+    if not data then return nil end
+    if data:sub(1, 3) == "\239\187\191" then data = data:sub(4) end -- UTF-8 BOM
+    local ok, v = pcall(json_decode, data)
+    if ok then return v end
+    return nil, v
+end
+
+local function join(a, b)
+    local sep = package.config:sub(1, 1)
+    if a:sub(-1) == "/" or a:sub(-1) == "\\" then return a .. b end
+    return a .. sep .. b
+end
+
+local function mra_props(list)
+    local res = {}
+    for _, p in ipairs(list or {}) do
+        local epc = tonumber(p.epc)
+        if epc then
+            res[epc] = res[epc] or {}
+            local vr = p.validRelease or {}
+            local pn = p.propertyName or {}
+            table.insert(res[epc], { from = vr.from or "A", to = vr.to or "latest",
+                                     ja = pn.ja, en = pn.en, data = p.data or {} })
+        end
+    end
+    return res
+end
+
+local function try_load_mra(dir)
+    if not dir or dir == "" then return nil end
+    if not read_file(join(dir, "metaData.json")) then
+        local sub = join(dir, "mraData")
+        if read_file(join(sub, "metaData.json")) then dir = sub else return nil end
+    end
+    local meta = read_json(join(dir, "metaData.json")) or {}
+    meta = meta.metaData or meta
+    local defs = read_json(join(join(dir, "definitions"), "definitions.json"))
+    local sup = read_json(join(join(dir, "superClass"), "0x0000.json"))
+    local node = read_json(join(join(dir, "nodeProfile"), "0x0EF0.json"))
+    if not (defs and sup and node) then return nil end
+    local m = {
+        meta = { release = meta.release, version = meta.dataVersion, date = meta.date },
+        defs = defs.definitions or defs,
+        super = mra_props(sup.elProperties),
+        classes = {},
+    }
+    local function add_class(d)
+        local cls = tonumber(d.eoj or "")
+        if not cls then return end
+        local cn = d.className or {}
+        local vr = d.validRelease or {}
+        m.classes[cls] = { ja = cn.ja, en = cn.en, from = vr.from, to = vr.to,
+                           props = mra_props(d.elProperties) }
+    end
+    add_class(node)
+    local ddir = join(dir, "devices")
+    if Dir.exists(ddir) then
+        for name in Dir.open(ddir, ".json") do
+            local d = read_json(join(ddir, name))
+            if d then add_class(d) end
+        end
+    end
+    return m, dir
+end
+
+local function mra_candidates(pref_dir)
+    local c = {}
+    if pref_dir and pref_dir ~= "" then c[#c + 1] = pref_dir end
+    local ok, p = pcall(Dir.personal_config_path, "echonet_mra")
+    if ok and p then c[#c + 1] = p end
+    ok, p = pcall(Dir.personal_plugins_path)
+    if ok and p then c[#c + 1] = join(p, "echonet_mra") end
+    return c
+end
+
+local function load_mra(pref_dir)
+    MRA, MRA_LOADED_FROM = nil, nil
+    for _, dir in ipairs(mra_candidates(pref_dir)) do
+        local ok, m, used = pcall(try_load_mra, dir)
+        if ok and m then
+            MRA, MRA_LOADED_FROM = m, used
+            local n = 0
+            for _ in pairs(m.classes) do n = n + 1 end
+            MRA_STATUS = string.format("MRA %s (Release %s), %d classes: %s",
+                tostring(m.meta.version), tostring(m.meta.release), n, used)
+            return
+        end
+    end
+    MRA_STATUS = "MRA not found (searched: " .. table.concat(mra_candidates(pref_dir), ", ") .. ")"
+end
+
+---------------------------------------------------------------------------
+-- Preferences / language
+---------------------------------------------------------------------------
+
+local RELEASES = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+local LANG_JA, LANG_EN = 1, 2
+
+el.prefs.language = Pref.enum("Language / 表示言語", LANG_JA,
+    "Language for class names, property names and values", {
+        { 1, "日本語 (Japanese)", LANG_JA },
+        { 2, "English", LANG_EN },
+    }, false)
+
+local release_enum = { { 1, "Latest (最新)", 0 } }
+for i = 1, #RELEASES do
+    local r = RELEASES:sub(i, i)
+    release_enum[#release_enum + 1] = { i + 1, "Release " .. r, i }
+    if r == "R" then break end
+end
+el.prefs.release = Pref.enum("APPENDIX Release", 0,
+    "Which Release of the APPENDIX to use when a property definition changed between Releases",
+    release_enum, false)
+el.prefs.mra_dir = Pref.string("MRA folder", "",
+    "Folder of the unpacked Machine Readable Appendix (contains metaData.json). " ..
+    "Empty: <personal configuration folder>/echonet_mra or <personal Lua plugins folder>/echonet_mra")
+el.prefs.udp_port = Pref.uint("UDP port", 3610, "UDP port for ECHONET Lite")
+el.prefs.heuristic = Pref.bool("Heuristic detection on other UDP ports", false,
+    "Try to detect ECHONET Lite frames (EHD1=0x10, EHD2=0x81/0x82) on any UDP port")
+
+local function ja() return el.prefs.language ~= LANG_EN end
+
+-- Pick ja/en from a {ja=..., en=...} table
+local function L(t)
+    if t == nil then return nil end
+    if type(t) == "string" then return t end
+    if ja() then
+        if t.ja and t.ja ~= "" then return t.ja end
+        return t.en
+    end
+    if t.en and t.en ~= "" then return t.en end
+    return t.ja
+end
+
+-- UI strings
+local S = {
+    all_instances = { ja = "全インスタンス", en = "all instances" },
+    unknown_class = { ja = "不明なクラス", en = "Unknown class" },
+    unknown_epc   = { ja = "不明", en = "Unknown" },
+    user_epc      = { ja = "ユーザ定義領域", en = "User-defined (manufacturer specific)" },
+    property      = { ja = "プロパティ", en = "Property" },
+    set_property  = { ja = "Set プロパティ", en = "Set Property" },
+    get_property  = { ja = "Get プロパティ", en = "Get Property" },
+    value         = { ja = "値", en = "Value" },
+    definition    = { ja = "定義", en = "Definition" },
+    release_range = { ja = "Release %s〜%s", en = "Release %s - %s" },
+    release_from  = { ja = "Release %s〜", en = "Release %s and later" },
+    not_in_rel    = { ja = "（選択中の Release %s には存在しない定義）", en = " (not defined in selected Release %s)" },
+    undefined     = { ja = "未定義値", en = "Undefined value" },
+    overflow      = { ja = "オーバーフロー", en = "Overflow" },
+    underflow     = { ja = "アンダーフロー", en = "Underflow" },
+    out_of_range  = { ja = "範囲外", en = "out of range" },
+    level         = { ja = "レベル %d", en = "Level %d" },
+    coefficient   = { ja = "係数 EPC %s を乗じる", en = "multiply by coefficient EPC %s" },
+    nprops        = { ja = "%d 個", en = "%d properties" },
+    ninst         = { ja = "%d インスタンス", en = "%d instances" },
+    nclass        = { ja = "%d クラス", en = "%d classes" },
+    map_count     = { ja = "プロパティ数", en = "Number of properties" },
+    inst_count    = { ja = "インスタンス数", en = "Number of instances" },
+    class_count   = { ja = "クラス数", en = "Number of classes" },
+    version_np    = { ja = "Ver.%d.%d（%s）", en = "Ver. %d.%d (%s)" },
+    fmt1          = { ja = "規定電文形式のみ", en = "specified message format only" },
+    fmt2          = { ja = "任意電文形式のみ", en = "arbitrary message format only" },
+    fmt3          = { ja = "規定電文形式・任意電文形式", en = "specified and arbitrary message formats" },
+    appendix_rel  = { ja = "APPENDIX Release %s rev.%d", en = "Appendix Release %s rev.%d" },
+    arbitrary     = { ja = "任意電文形式", en = "Arbitrary message format" },
+    truncated     = { ja = "電文が短すぎます", en = "Truncated ECHONET Lite frame" },
+}
+local function T(key) return L(S[key]) end
+
+---------------------------------------------------------------------------
+-- Static tables (header / ESV / class groups / class names outside the MRA)
+---------------------------------------------------------------------------
+
+local EHD1_NAMES = { [0x10] = "ECHONET Lite" }
 local EHD2_NAMES = {
     [0x81] = "Format 1 (specified message format)",
     [0x82] = "Format 2 (arbitrary message format)",
 }
 
 local ESV_NAMES = {
-    -- Requests
-    [0x60] = "SetI",        -- Property value write request (no response required)
-    [0x61] = "SetC",        -- Property value write request (response required)
-    [0x62] = "Get",         -- Property value read request
-    [0x63] = "INF_REQ",     -- Property value notification request
-    [0x6E] = "SetGet",      -- Property value write & read request
-    -- Responses / notifications
-    [0x71] = "Set_Res",
-    [0x72] = "Get_Res",
-    [0x73] = "INF",
-    [0x74] = "INFC",
-    [0x7A] = "INFC_Res",
+    [0x60] = "SetI", [0x61] = "SetC", [0x62] = "Get", [0x63] = "INF_REQ", [0x6E] = "SetGet",
+    [0x71] = "Set_Res", [0x72] = "Get_Res", [0x73] = "INF", [0x74] = "INFC", [0x7A] = "INFC_Res",
     [0x7E] = "SetGet_Res",
-    -- Not-possible responses
-    [0x50] = "SetI_SNA",
-    [0x51] = "SetC_SNA",
-    [0x52] = "Get_SNA",
-    [0x53] = "INF_SNA",
-    [0x5E] = "SetGet_SNA",
+    [0x50] = "SetI_SNA", [0x51] = "SetC_SNA", [0x52] = "Get_SNA", [0x53] = "INF_SNA", [0x5E] = "SetGet_SNA",
 }
 
 local ESV_DESC = {
-    [0x60] = "Property value write request (no response required)",
-    [0x61] = "Property value write request (response required)",
-    [0x62] = "Property value read request",
-    [0x63] = "Property value notification request",
-    [0x6E] = "Property value write & read request",
-    [0x71] = "Property value write response",
-    [0x72] = "Property value read response",
-    [0x73] = "Property value notification",
-    [0x74] = "Property value notification (response required)",
-    [0x7A] = "Property value notification response",
-    [0x7E] = "Property value write & read response",
-    [0x50] = "Property value write request (no response) not possible",
-    [0x51] = "Property value write request not possible",
-    [0x52] = "Property value read not possible",
-    [0x53] = "Property value notification not possible",
-    [0x5E] = "Property value write & read not possible",
+    [0x60] = { ja = "プロパティ値書き込み要求（応答不要）", en = "Property value write request (no response required)" },
+    [0x61] = { ja = "プロパティ値書き込み要求（応答要）", en = "Property value write request (response required)" },
+    [0x62] = { ja = "プロパティ値読み出し要求", en = "Property value read request" },
+    [0x63] = { ja = "プロパティ値通知要求", en = "Property value notification request" },
+    [0x6E] = { ja = "プロパティ値書き込み・読み出し要求", en = "Property value write & read request" },
+    [0x71] = { ja = "プロパティ値書き込み応答", en = "Property value write response" },
+    [0x72] = { ja = "プロパティ値読み出し応答", en = "Property value read response" },
+    [0x73] = { ja = "プロパティ値通知", en = "Property value notification" },
+    [0x74] = { ja = "プロパティ値通知（応答要）", en = "Property value notification (response required)" },
+    [0x7A] = { ja = "プロパティ値通知応答", en = "Property value notification response" },
+    [0x7E] = { ja = "プロパティ値書き込み・読み出し応答", en = "Property value write & read response" },
+    [0x50] = { ja = "プロパティ値書き込み要求不可応答（応答不要）", en = "Property value write request (no response required) not possible" },
+    [0x51] = { ja = "プロパティ値書き込み要求不可応答", en = "Property value write request not possible" },
+    [0x52] = { ja = "プロパティ値読み出し不可応答", en = "Property value read not possible" },
+    [0x53] = { ja = "プロパティ値通知不可応答", en = "Property value notification not possible" },
+    [0x5E] = { ja = "プロパティ値書き込み・読み出し不可応答", en = "Property value write & read not possible" },
 }
 
 local SETGET_ESV = { [0x6E] = true, [0x7E] = true, [0x5E] = true }
 
 local CLASS_GROUP_NAMES = {
-    [0x00] = "Sensor-related device",
-    [0x01] = "Air conditioner-related device",
-    [0x02] = "Housing/facility-related device",
-    [0x03] = "Cooking/housework-related device",
-    [0x04] = "Health-related device",
-    [0x05] = "Management/control-related device",
-    [0x06] = "Audiovisual-related device",
-    [0x0E] = "Profile",
-    [0x0F] = "User definition",
+    [0x00] = { ja = "センサ関連機器", en = "Sensor-related device" },
+    [0x01] = { ja = "空調関連機器", en = "Air conditioner-related device" },
+    [0x02] = { ja = "住宅・設備関連機器", en = "Housing/facility-related device" },
+    [0x03] = { ja = "調理・家事関連機器", en = "Cooking/housework-related device" },
+    [0x04] = { ja = "健康関連機器", en = "Health-related device" },
+    [0x05] = { ja = "管理・操作関連機器", en = "Management/control-related device" },
+    [0x06] = { ja = "AV関連機器", en = "Audiovisual-related device" },
+    [0x0E] = { ja = "プロファイル", en = "Profile" },
+    [0x0F] = { ja = "ユーザ定義", en = "User definition" },
 }
 
--- key = (class group << 8) | class
-local CLASS_NAMES = {
-    -- 0x00 Sensors
-    [0x0001] = "Gas leak sensor",
-    [0x0002] = "Crime prevention sensor",
-    [0x0003] = "Emergency button",
-    [0x0004] = "First-aid sensor",
-    [0x0005] = "Earthquake sensor",
-    [0x0006] = "Electric leak sensor",
-    [0x0007] = "Human detection sensor",
-    [0x0008] = "Visitor sensor",
-    [0x0009] = "Call sensor",
-    [0x000A] = "Condensation sensor",
-    [0x000B] = "Air pollution sensor",
-    [0x000C] = "Oxygen sensor",
-    [0x000D] = "Illuminance sensor",
-    [0x000E] = "Sound sensor",
-    [0x000F] = "Mailing sensor",
-    [0x0010] = "Weight sensor",
-    [0x0011] = "Temperature sensor",
-    [0x0012] = "Humidity sensor",
-    [0x0013] = "Rain sensor",
-    [0x0014] = "Water level sensor",
-    [0x0015] = "Bath water level sensor",
-    [0x0016] = "Bath heating status sensor",
-    [0x0017] = "Water leak sensor",
-    [0x0018] = "Water overflow sensor",
-    [0x0019] = "Fire sensor",
-    [0x001A] = "Cigarette smoke sensor",
-    [0x001B] = "CO2 sensor",
-    [0x001C] = "Gas sensor",
-    [0x001D] = "VOC sensor",
-    [0x001E] = "Differential pressure sensor",
-    [0x001F] = "Air speed sensor",
-    [0x0020] = "Odor sensor",
-    [0x0021] = "Flame sensor",
-    [0x0022] = "Electric energy sensor",
-    [0x0023] = "Current value sensor",
-    [0x0025] = "Water flow rate sensor",
-    [0x0026] = "Micromotion sensor",
-    [0x0027] = "Passage sensor",
-    [0x0028] = "Bed presence sensor",
-    [0x0029] = "Open/close sensor",
-    [0x002A] = "Activity amount sensor",
-    [0x002B] = "Human body location sensor",
-    [0x002C] = "Snow sensor",
-    [0x002D] = "Air pressure sensor",
-    -- 0x01 Air conditioners
-    [0x0130] = "Home air conditioner",
-    [0x0131] = "Cold blaster",
-    [0x0132] = "Electric fan",
-    [0x0133] = "Ventilation fan",
-    [0x0134] = "Air conditioner ventilation fan",
-    [0x0135] = "Air cleaner",
-    [0x0136] = "Cold blast fan",
-    [0x0137] = "Circulator",
-    [0x0138] = "Dehumidifier",
-    [0x0139] = "Humidifier",
-    [0x0156] = "Package-type commercial air conditioner (indoor unit, except for facility use)",
-    [0x0157] = "Package-type commercial air conditioner (outdoor unit, except for facility use)",
-    -- 0x02 Housing / facilities
-    [0x0260] = "Electrically operated blind/shade",
-    [0x0261] = "Electrically operated shutter",
-    [0x0262] = "Electrically operated curtain",
-    [0x0263] = "Electrically operated rain sliding door/shutter",
-    [0x0264] = "Electrically operated gate",
-    [0x0265] = "Electrically operated window",
-    [0x0266] = "Automatically operated entrance door/sliding door",
-    [0x0267] = "Garden sprinkler",
-    [0x0268] = "Fire sprinkler",
-    [0x0269] = "Fountain",
-    [0x026A] = "Instantaneous water heater",
-    [0x026B] = "Electric water heater",
-    [0x026C] = "Solar water heater",
-    [0x026D] = "Circulation pump",
-    [0x026E] = "Bidet-equipped toilet (with electrically warmed seat)",
-    [0x026F] = "Electric lock",
-    [0x0270] = "Gas line valve",
-    [0x0271] = "Home sauna",
-    [0x0272] = "Hot water generator",
-    [0x0273] = "Bathroom dryer",
-    [0x0274] = "Home elevator",
-    [0x0275] = "Electrically operated room divider",
-    [0x0276] = "Horizontal transfer",
-    [0x0277] = "Electrically operated clothes-drying pole",
-    [0x0278] = "Septic tank",
-    [0x0279] = "Household solar power generation",
-    [0x027A] = "Cold or hot water heat source equipment",
-    [0x027B] = "Floor heater",
-    [0x027C] = "Fuel cell",
-    [0x027D] = "Storage battery",
-    [0x027E] = "Electric vehicle charger/discharger",
-    [0x027F] = "Engine cogeneration",
-    [0x0280] = "Electric energy meter",
-    [0x0281] = "Water flow meter",
-    [0x0282] = "Gas meter",
-    [0x0283] = "LP gas meter",
-    [0x0284] = "Clock",
-    [0x0285] = "Automatic door",
-    [0x0286] = "Commercial elevator",
-    [0x0287] = "Power distribution board metering",
-    [0x0288] = "Low-voltage smart electric energy meter",
-    [0x0289] = "Smart gas meter",
-    [0x028A] = "High-voltage smart electric energy meter",
-    [0x028B] = "Kerosene meter",
-    [0x028C] = "Smart kerosene meter",
-    [0x028D] = "Smart electric energy sub-meter",
-    [0x0290] = "General lighting",
-    [0x0291] = "Mono functional lighting",
-    [0x0299] = "Emergency lighting",
-    [0x029D] = "Equipment light",
-    [0x02A0] = "Buzzer",
-    [0x02A1] = "Electric vehicle charger",
-    [0x02A2] = "Household small wind turbine power generation",
-    [0x02A3] = "Lighting system",
-    [0x02A4] = "Extended lighting system",
-    [0x02A5] = "Multiple input PCS",
-    [0x02A6] = "Hybrid water heater",
-    [0x02A7] = "Frequency regulation",
-    [0x02A8] = "Smart electric energy meter for sharing",
-    -- 0x03 Cooking / housework
-    [0x03B0] = "Coffee machine",
-    [0x03B1] = "Coffee mill",
-    [0x03B2] = "Electric hot water pot",
-    [0x03B3] = "Electric stove",
-    [0x03B4] = "Toaster",
-    [0x03B5] = "Juicer/food mixer",
-    [0x03B6] = "Food processor",
-    [0x03B7] = "Refrigerator",
-    [0x03B8] = "Combination microwave oven",
-    [0x03B9] = "Cooking heater",
-    [0x03BA] = "Oven",
-    [0x03BB] = "Rice cooker",
-    [0x03BC] = "Electronic jar",
-    [0x03BD] = "Dish washer",
-    [0x03BE] = "Dish dryer",
-    [0x03BF] = "Electric rice card cooker",
-    [0x03C0] = "Keep-warm machine",
-    [0x03C1] = "Rice mill",
-    [0x03C2] = "Automatic bread cooker",
-    [0x03C3] = "Slow cooker",
-    [0x03C4] = "Electric pickles cooker",
-    [0x03C5] = "Washing machine",
-    [0x03C6] = "Clothes dryer",
-    [0x03C7] = "Electric iron",
-    [0x03C8] = "Trouser press",
-    [0x03C9] = "Futon dryer",
-    [0x03CA] = "Small article/shoes dryer",
-    [0x03CB] = "Electric vacuum cleaner",
-    [0x03CC] = "Disposer",
-    [0x03CD] = "Electric mosquito catcher",
-    [0x03CE] = "Commercial show case",
-    [0x03CF] = "Commercial refrigerator",
-    [0x03D0] = "Commercial hot case",
-    [0x03D1] = "Commercial fryer",
-    [0x03D2] = "Commercial microwave oven",
-    [0x03D3] = "Washer and dryer",
-    [0x03D4] = "Commercial show case outdoor unit",
-    -- 0x04 Health
-    [0x0401] = "Weighing machine",
-    [0x0402] = "Clinical thermometer",
-    [0x0403] = "Blood pressure meter",
-    [0x0404] = "Blood sugar meter",
-    [0x0405] = "Body fat meter",
-    -- 0x05 Management / control
-    [0x05FA] = "Parallel processing combination-type power control",
-    [0x05FB] = "DR controller",
-    [0x05FC] = "Secure communication shared key setup node",
-    [0x05FD] = "Switch (supporting JEM-A/HA terminals)",
-    [0x05FE] = "Portable terminal",
-    [0x05FF] = "Controller",
-    -- 0x06 AV
-    [0x0601] = "Display",
-    [0x0602] = "Television",
-    [0x0603] = "Audio",
-    [0x0604] = "Network camera",
-    -- 0x0E Profile
-    [0x0EF0] = "Node profile",
+-- Built-in class names (used when the MRA is not installed, and for classes the MRA does not cover)
+local BUILTIN_CLASS_NAMES = {
+    [0x0001] = { ja = "ガス漏れセンサ", en = "Gas leak sensor" },
+    [0x0002] = { ja = "防犯センサ", en = "Crime prevention sensor" },
+    [0x0003] = { ja = "非常ボタン", en = "Emergency button" },
+    [0x0004] = { ja = "救急用センサ", en = "First-aid sensor" },
+    [0x0005] = { ja = "地震センサ", en = "Earthquake sensor" },
+    [0x0006] = { ja = "漏電センサ", en = "Electric leak sensor" },
+    [0x0007] = { ja = "人体検知センサ", en = "Human detection sensor" },
+    [0x0008] = { ja = "来客センサ", en = "Visitor sensor" },
+    [0x0009] = { ja = "呼び出しセンサ", en = "Call sensor" },
+    [0x000A] = { ja = "結露センサ", en = "Condensation sensor" },
+    [0x000B] = { ja = "空気汚染センサ", en = "Air pollution sensor" },
+    [0x000C] = { ja = "酸素センサ", en = "Oxygen sensor" },
+    [0x000D] = { ja = "照度センサ", en = "Illuminance sensor" },
+    [0x000E] = { ja = "音センサ", en = "Sound sensor" },
+    [0x000F] = { ja = "投函センサ", en = "Mailing sensor" },
+    [0x0010] = { ja = "重荷センサ", en = "Weight sensor" },
+    [0x0011] = { ja = "温度センサ", en = "Temperature sensor" },
+    [0x0012] = { ja = "湿度センサ", en = "Humidity sensor" },
+    [0x0013] = { ja = "雨センサ", en = "Rain sensor" },
+    [0x0014] = { ja = "水位センサ", en = "Water level sensor" },
+    [0x0015] = { ja = "風呂水位センサ", en = "Bath water level sensor" },
+    [0x0016] = { ja = "風呂沸き上がりセンサ", en = "Bath heating status sensor" },
+    [0x0017] = { ja = "水漏れセンサ", en = "Water leak sensor" },
+    [0x0018] = { ja = "水あふれセンサ", en = "Water overflow sensor" },
+    [0x0019] = { ja = "火災センサ", en = "Fire sensor" },
+    [0x001A] = { ja = "タバコ煙センサ", en = "Cigarette smoke sensor" },
+    [0x001B] = { ja = "CO2センサ", en = "CO2 sensor" },
+    [0x001C] = { ja = "ガスセンサ", en = "Gas sensor" },
+    [0x001D] = { ja = "VOCセンサ", en = "VOC sensor" },
+    [0x001E] = { ja = "差圧センサ", en = "Differential pressure sensor" },
+    [0x001F] = { ja = "風速センサ", en = "Air speed sensor" },
+    [0x0020] = { ja = "臭いセンサ", en = "Odor sensor" },
+    [0x0021] = { ja = "炎センサ", en = "Flame sensor" },
+    [0x0022] = { ja = "電力量センサ", en = "Electric energy sensor" },
+    [0x0023] = { ja = "電流量センサ", en = "Current value sensor" },
+    [0x0025] = { ja = "水流量センサ", en = "Water flow rate sensor" },
+    [0x0026] = { ja = "微動センサ", en = "Micromotion sensor" },
+    [0x0027] = { ja = "通過センサ", en = "Passage sensor" },
+    [0x0028] = { ja = "在床センサ", en = "Bed presence sensor" },
+    [0x0029] = { ja = "開閉センサ", en = "Open/close sensor" },
+    [0x002A] = { ja = "活動量センサ", en = "Activity amount sensor" },
+    [0x002B] = { ja = "人体位置センサ", en = "Human body location sensor" },
+    [0x002C] = { ja = "雪センサ", en = "Snow sensor" },
+    [0x002D] = { ja = "気圧センサ", en = "Air pressure sensor" },
+    [0x0130] = { ja = "家庭用エアコン", en = "Home air conditioner" },
+    [0x0131] = { ja = "", en = "Cold blaster" },
+    [0x0132] = { ja = "扇風機", en = "Electric fan" },
+    [0x0133] = { ja = "換気扇", en = "Ventilation fan" },
+    [0x0134] = { ja = "空調換気扇", en = "Air conditioner ventilation fan" },
+    [0x0135] = { ja = "空気清浄器", en = "Air cleaner" },
+    [0x0136] = { ja = "", en = "Cold blast fan" },
+    [0x0137] = { ja = "", en = "Circulator" },
+    [0x0138] = { ja = "", en = "Dehumidifier" },
+    [0x0139] = { ja = "加湿器", en = "Humidifier" },
+    [0x0156] = { ja = "業務用パッケージエアコン室内機（設備用除く）", en = "Package-type commercial air conditioner (indoor unit, except for facility use)" },
+    [0x0157] = { ja = "業務用パッケージエアコン室外機（設備用除く）", en = "Package-type commercial air conditioner (outdoor unit, except for facility use)" },
+    [0x0260] = { ja = "電動ブラインド・日よけ", en = "Electrically operated blind/shade" },
+    [0x0261] = { ja = "", en = "Electrically operated shutter" },
+    [0x0262] = { ja = "電動カーテン", en = "Electrically operated curtain" },
+    [0x0263] = { ja = "電動雨戸・シャッター", en = "Electrically operated rain sliding door/shutter" },
+    [0x0264] = { ja = "電動ゲート", en = "Electrically operated gate" },
+    [0x0265] = { ja = "電動窓", en = "Electrically operated window" },
+    [0x0266] = { ja = "", en = "Automatically operated entrance door/sliding door" },
+    [0x0267] = { ja = "", en = "Garden sprinkler" },
+    [0x0268] = { ja = "", en = "Fire sprinkler" },
+    [0x0269] = { ja = "", en = "Fountain" },
+    [0x026A] = { ja = "", en = "Instantaneous water heater" },
+    [0x026B] = { ja = "電気温水器", en = "Electric water heater" },
+    [0x026C] = { ja = "太陽熱温水器", en = "Solar water heater" },
+    [0x026D] = { ja = "", en = "Circulation pump" },
+    [0x026E] = { ja = "電気便座（温水洗浄便座、暖房便座など）", en = "Bidet-equipped toilet (with electrically warmed seat)" },
+    [0x026F] = { ja = "電気錠", en = "Electric lock" },
+    [0x0270] = { ja = "", en = "Gas line valve" },
+    [0x0271] = { ja = "ホームサウナ", en = "Home sauna" },
+    [0x0272] = { ja = "瞬間式給湯器", en = "Hot water generator" },
+    [0x0273] = { ja = "浴室暖房乾燥機", en = "Bathroom dryer" },
+    [0x0274] = { ja = "ホームエレベータ", en = "Home elevator" },
+    [0x0275] = { ja = "", en = "Electrically operated room divider" },
+    [0x0276] = { ja = "", en = "Horizontal transfer" },
+    [0x0277] = { ja = "", en = "Electrically operated clothes-drying pole" },
+    [0x0278] = { ja = "", en = "Septic tank" },
+    [0x0279] = { ja = "住宅用太陽光発電", en = "Household solar power generation" },
+    [0x027A] = { ja = "冷温水熱源機", en = "Cold or hot water heat source equipment" },
+    [0x027B] = { ja = "床暖房", en = "Floor heater" },
+    [0x027C] = { ja = "燃料電池", en = "Fuel cell" },
+    [0x027D] = { ja = "蓄電池", en = "Storage battery" },
+    [0x027E] = { ja = "電気自動車充放電器", en = "Electric vehicle charger/discharger" },
+    [0x027F] = { ja = "", en = "Engine cogeneration" },
+    [0x0280] = { ja = "電力量メータ", en = "Electric energy meter" },
+    [0x0281] = { ja = "水流量メータ", en = "Water flow meter" },
+    [0x0282] = { ja = "ガスメータ", en = "Gas meter" },
+    [0x0283] = { ja = "LPガスメータ", en = "LP gas meter" },
+    [0x0284] = { ja = "時計", en = "Clock" },
+    [0x0285] = { ja = "自動ドア", en = "Automatic door" },
+    [0x0286] = { ja = "業務用エレベータ", en = "Commercial elevator" },
+    [0x0287] = { ja = "分電盤メータリング", en = "Power distribution board metering" },
+    [0x0288] = { ja = "低圧スマート電力量メータ", en = "Low-voltage smart electric energy meter" },
+    [0x0289] = { ja = "スマートガスメータ", en = "Smart gas meter" },
+    [0x028A] = { ja = "高圧スマート電力量メータ", en = "High-voltage smart electric energy meter" },
+    [0x028B] = { ja = "灯油メータ", en = "Kerosene meter" },
+    [0x028C] = { ja = "スマート灯油メータ", en = "Smart kerosene meter" },
+    [0x028D] = { ja = "スマート電力量サブメータ", en = "Smart electric energy sub-meter" },
+    [0x0290] = { ja = "一般照明", en = "General lighting" },
+    [0x0291] = { ja = "単機能照明", en = "Mono functional lighting" },
+    [0x0299] = { ja = "", en = "Emergency lighting" },
+    [0x029D] = { ja = "", en = "Equipment light" },
+    [0x02A0] = { ja = "ブザー", en = "Buzzer" },
+    [0x02A1] = { ja = "電気自動車充電器", en = "Electric vehicle charger" },
+    [0x02A2] = { ja = "家庭用小型風力発電", en = "Household small wind turbine power generation" },
+    [0x02A3] = { ja = "照明システム", en = "Lighting system" },
+    [0x02A4] = { ja = "", en = "Extended lighting system" },
+    [0x02A5] = { ja = "マルチ入力PCS", en = "Multiple input PCS" },
+    [0x02A6] = { ja = "ハイブリッド給湯機", en = "Hybrid water heater" },
+    [0x02A7] = { ja = "", en = "Frequency regulation" },
+    [0x02A8] = { ja = "", en = "Smart electric energy meter for sharing" },
+    [0x03B0] = { ja = "コーヒーメーカ", en = "Coffee machine" },
+    [0x03B1] = { ja = "", en = "Coffee mill" },
+    [0x03B2] = { ja = "電気ポット", en = "Electric hot water pot" },
+    [0x03B3] = { ja = "", en = "Electric stove" },
+    [0x03B4] = { ja = "トースター", en = "Toaster" },
+    [0x03B5] = { ja = "", en = "Juicer/food mixer" },
+    [0x03B6] = { ja = "", en = "Food processor" },
+    [0x03B7] = { ja = "冷凍冷蔵庫", en = "Refrigerator" },
+    [0x03B8] = { ja = "オーブンレンジ", en = "Combination microwave oven" },
+    [0x03B9] = { ja = "クッキングヒータ", en = "Cooking heater" },
+    [0x03BA] = { ja = "オーブン", en = "Oven" },
+    [0x03BB] = { ja = "炊飯器", en = "Rice cooker" },
+    [0x03BC] = { ja = "", en = "Electronic jar" },
+    [0x03BD] = { ja = "食器洗い機", en = "Dish washer" },
+    [0x03BE] = { ja = "食器乾燥機", en = "Dish dryer" },
+    [0x03BF] = { ja = "", en = "Electric rice card cooker" },
+    [0x03C0] = { ja = "", en = "Keep-warm machine" },
+    [0x03C1] = { ja = "", en = "Rice mill" },
+    [0x03C2] = { ja = "", en = "Automatic bread cooker" },
+    [0x03C3] = { ja = "", en = "Slow cooker" },
+    [0x03C4] = { ja = "", en = "Electric pickles cooker" },
+    [0x03C5] = { ja = "洗濯機", en = "Washing machine" },
+    [0x03C6] = { ja = "衣類乾燥機", en = "Clothes dryer" },
+    [0x03C7] = { ja = "", en = "Electric iron" },
+    [0x03C8] = { ja = "", en = "Trouser press" },
+    [0x03C9] = { ja = "", en = "Futon dryer" },
+    [0x03CA] = { ja = "", en = "Small article/shoes dryer" },
+    [0x03CB] = { ja = "電気掃除機", en = "Electric vacuum cleaner" },
+    [0x03CC] = { ja = "", en = "Disposer" },
+    [0x03CD] = { ja = "", en = "Electric mosquito catcher" },
+    [0x03CE] = { ja = "業務用ショーケース", en = "Commercial show case" },
+    [0x03CF] = { ja = "", en = "Commercial refrigerator" },
+    [0x03D0] = { ja = "", en = "Commercial hot case" },
+    [0x03D1] = { ja = "", en = "Commercial fryer" },
+    [0x03D2] = { ja = "", en = "Commercial microwave oven" },
+    [0x03D3] = { ja = "洗濯乾燥機", en = "Washer and dryer" },
+    [0x03D4] = { ja = "", en = "Commercial show case outdoor unit" },
+    [0x0401] = { ja = "体重計", en = "Weighing machine" },
+    [0x0402] = { ja = "体温計", en = "Clinical thermometer" },
+    [0x0403] = { ja = "血圧計", en = "Blood pressure meter" },
+    [0x0404] = { ja = "血糖値計", en = "Blood sugar meter" },
+    [0x0405] = { ja = "体脂肪計", en = "Body fat meter" },
+    [0x05FA] = { ja = "", en = "Parallel processing combination-type power control" },
+    [0x05FB] = { ja = "", en = "DR controller" },
+    [0x05FC] = { ja = "", en = "Secure communication shared key setup node" },
+    [0x05FD] = { ja = "スイッチ（JEM-A/HA端子対応）", en = "Switch (supporting JEM-A/HA terminals)" },
+    [0x05FE] = { ja = "携帯端末", en = "Portable terminal" },
+    [0x05FF] = { ja = "コントローラ", en = "Controller" },
+    [0x0601] = { ja = "ディスプレー", en = "Display" },
+    [0x0602] = { ja = "テレビ", en = "Television" },
+    [0x0603] = { ja = "オーディオ", en = "Audio" },
+    [0x0604] = { ja = "ネットワークカメラ", en = "Network camera" },
+    [0x0EF0] = { ja = "ノードプロファイル", en = "Node profile" },
 }
 
--- Device object super class EPCs (0x80 - 0x9F)
-local SUPER_EPC_NAMES = {
-    [0x80] = "Operation status",
-    [0x81] = "Installation location",
-    [0x82] = "Standard version information",
-    [0x83] = "Identification number",
-    [0x84] = "Measured instantaneous power consumption",
-    [0x85] = "Measured cumulative electric energy consumption",
-    [0x86] = "Manufacturer's fault code",
-    [0x87] = "Current limit setting",
-    [0x88] = "Fault status",
-    [0x89] = "Fault description",
-    [0x8A] = "Manufacturer code",
-    [0x8B] = "Business facility code",
-    [0x8C] = "Product code",
-    [0x8D] = "Production number",
-    [0x8E] = "Production date",
-    [0x8F] = "Power-saving operation setting",
-    [0x93] = "Remote control setting",
-    [0x97] = "Current time setting",
-    [0x98] = "Current date setting",
-    [0x99] = "Power limit setting",
-    [0x9A] = "Cumulative operating time",
-    [0x9B] = "SetM property map",
-    [0x9C] = "GetM property map",
-    [0x9D] = "Status change announcement property map",
-    [0x9E] = "Set property map",
-    [0x9F] = "Get property map",
+local LOCATION_NAMES = {
+    [1] = { ja = "居間・リビング", en = "Living room" }, [2] = { ja = "食堂・ダイニング", en = "Dining room" },
+    [3] = { ja = "台所・キッチン", en = "Kitchen" }, [4] = { ja = "浴室・バス", en = "Bathroom" },
+    [5] = { ja = "トイレ", en = "Lavatory" }, [6] = { ja = "洗面所・脱衣所", en = "Washroom/changing room" },
+    [7] = { ja = "廊下", en = "Passageway" }, [8] = { ja = "部屋", en = "Room" },
+    [9] = { ja = "階段", en = "Stairway" }, [10] = { ja = "玄関", en = "Front door" },
+    [11] = { ja = "納戸", en = "Storeroom" }, [12] = { ja = "庭・外周", en = "Garden/perimeter" },
+    [13] = { ja = "車庫", en = "Garage" }, [14] = { ja = "ベランダ・バルコニー", en = "Veranda/balcony" },
+    [15] = { ja = "その他", en = "Others" },
 }
 
--- Class specific EPC names, key = class code (group<<8|class)
-local CLASS_EPC_NAMES = {
+-- Built-in names of the device object super class / node profile (used without the MRA)
+local SUPER_NAMES = {
+    [0x80] = { ja = "動作状態", en = "Operation status" },
+    [0x81] = { ja = "設置場所", en = "Installation location" },
+    [0x82] = { ja = "規格Version情報", en = "Standard version information" },
+    [0x83] = { ja = "識別番号", en = "Identification number" },
+    [0x84] = { ja = "瞬時消費電力計測値", en = "Measured instantaneous power consumption" },
+    [0x85] = { ja = "積算消費電力量計測値", en = "Measured cumulative electric energy consumption" },
+    [0x86] = { ja = "メーカ異常コード", en = "Manufacturer's fault code" },
+    [0x87] = { ja = "電流制限設定", en = "Current limit setting" },
+    [0x88] = { ja = "異常発生状態", en = "Fault status" },
+    [0x89] = { ja = "異常内容", en = "Fault description" },
+    [0x8A] = { ja = "メーカコード", en = "Manufacturer code" },
+    [0x8B] = { ja = "事業場コード", en = "Business facility code" },
+    [0x8C] = { ja = "商品コード", en = "Product code" },
+    [0x8D] = { ja = "製造番号", en = "Production number" },
+    [0x8E] = { ja = "製造年月日", en = "Production date" },
+    [0x8F] = { ja = "節電動作設定", en = "Power-saving operation setting" },
+    [0x93] = { ja = "遠隔操作設定", en = "Remote control setting" },
+    [0x97] = { ja = "現在時刻設定", en = "Current time setting" },
+    [0x98] = { ja = "現在年月日設定", en = "Current date setting" },
+    [0x99] = { ja = "電力制限設定", en = "Power limit setting" },
+    [0x9A] = { ja = "積算運転時間", en = "Cumulative operating time" },
+    [0x9B] = { ja = "SetMプロパティマップ", en = "SetM property map" },
+    [0x9C] = { ja = "GetMプロパティマップ", en = "GetM property map" },
+    [0x9D] = { ja = "状変アナウンスプロパティマップ", en = "Status change announcement property map" },
+    [0x9E] = { ja = "Setプロパティマップ", en = "Set property map" },
+    [0x9F] = { ja = "Getプロパティマップ", en = "Get property map" },
+}
+local NODE_NAMES = {
+    [0x82] = { ja = "Version情報", en = "Version information" },
+    [0xBF] = { ja = "個体識別情報", en = "Unique identifier data" },
+    [0xD3] = { ja = "自ノードインスタンス数", en = "Number of self-node instances" },
+    [0xD4] = { ja = "自ノードクラス数", en = "Number of self-node classes" },
+    [0xD5] = { ja = "インスタンスリスト通知", en = "Instance list notification" },
+    [0xD6] = { ja = "自ノードインスタンスリストS", en = "Self-node instance list S" },
+    [0xD7] = { ja = "自ノードクラスリストS", en = "Self-node class list S" },
+}
+
+local FALLBACK_EPC_NAMES = {
     -- Node profile
     [0x0EF0] = {
         [0x80] = "Operating status",
@@ -530,13 +816,6 @@ local CLASS_EPC_NAMES = {
     },
 }
 
-local LOCATION_NAMES = {
-    [1] = "Living room", [2] = "Dining room", [3] = "Kitchen", [4] = "Bathroom",
-    [5] = "Lavatory", [6] = "Washroom/changing room", [7] = "Passageway", [8] = "Room",
-    [9] = "Stairway", [10] = "Front door", [11] = "Storeroom", [12] = "Garden/perimeter",
-    [13] = "Garage", [14] = "Veranda/balcony", [15] = "Others",
-}
-
 local AC_MODE_NAMES = {
     [0x40] = "Other", [0x41] = "Automatic", [0x42] = "Cooling", [0x43] = "Heating",
     [0x44] = "Dehumidification", [0x45] = "Air circulator",
@@ -546,6 +825,13 @@ local CUM_UNIT_NAMES = {
     [0x00] = "1 kWh", [0x01] = "0.1 kWh", [0x02] = "0.01 kWh", [0x03] = "0.001 kWh",
     [0x04] = "0.0001 kWh", [0x0A] = "10 kWh", [0x0B] = "100 kWh", [0x0C] = "1000 kWh",
     [0x0D] = "10000 kWh",
+}
+
+local UNIT_NAMES = {
+    Celsius = "℃", minute = { ja = "分", en = "min" }, minutes = { ja = "分", en = "min" },
+    second = { ja = "秒", en = "s" }, days = { ja = "日", en = "days" }, degree = "°",
+    liter = "L", m3 = "m³", ["m3/h"] = "m³/h", lux = "lx", klux = "klx",
+    digit = { ja = "桁", en = "digits" },
 }
 
 ---------------------------------------------------------------------------
@@ -559,8 +845,8 @@ f.tid       = ProtoField.uint16("echonetlite.tid", "TID", base.DEC_HEX)
 f.edata     = ProtoField.bytes ("echonetlite.edata", "EDATA")
 f.seoj      = ProtoField.uint24("echonetlite.seoj", "SEOJ", base.HEX)
 f.deoj      = ProtoField.uint24("echonetlite.deoj", "DEOJ", base.HEX)
-f.eoj_group = ProtoField.uint8 ("echonetlite.eoj.group", "Class group code", base.HEX, CLASS_GROUP_NAMES)
-f.eoj_class = ProtoField.uint16("echonetlite.eoj.class", "Class code", base.HEX, CLASS_NAMES)
+f.eoj_group = ProtoField.uint8 ("echonetlite.eoj.group", "Class group code", base.HEX)
+f.eoj_class = ProtoField.uint16("echonetlite.eoj.class", "Class code", base.HEX)
 f.eoj_inst  = ProtoField.uint8 ("echonetlite.eoj.instance", "Instance code", base.HEX)
 f.esv       = ProtoField.uint8 ("echonetlite.esv", "ESV", base.HEX, ESV_NAMES)
 f.opc       = ProtoField.uint8 ("echonetlite.opc", "OPC", base.DEC)
@@ -568,20 +854,23 @@ f.opcset    = ProtoField.uint8 ("echonetlite.opcset", "OPCSet", base.DEC)
 f.opcget    = ProtoField.uint8 ("echonetlite.opcget", "OPCGet", base.DEC)
 f.prop      = ProtoField.none  ("echonetlite.property", "Property")
 f.epc       = ProtoField.uint8 ("echonetlite.epc", "EPC", base.HEX)
+f.epc_name  = ProtoField.string("echonetlite.epc.name", "Property name")
 f.pdc       = ProtoField.uint8 ("echonetlite.pdc", "PDC", base.DEC)
 f.edt       = ProtoField.bytes ("echonetlite.edt", "EDT")
 f.value     = ProtoField.string("echonetlite.edt.value", "Value")
+f.element   = ProtoField.string("echonetlite.edt.element", "Element")
+f.defrel    = ProtoField.string("echonetlite.edt.release", "Definition release")
 f.map_count = ProtoField.uint8 ("echonetlite.propmap.count", "Number of properties", base.DEC)
 f.map_epc   = ProtoField.uint8 ("echonetlite.propmap.epc", "Property", base.HEX)
 f.inst_count= ProtoField.uint8 ("echonetlite.instlist.count", "Number of instances", base.DEC)
 f.inst_eoj  = ProtoField.uint24("echonetlite.instlist.eoj", "EOJ", base.HEX)
 f.cls_count = ProtoField.uint8 ("echonetlite.classlist.count", "Number of classes", base.DEC)
-f.cls_code  = ProtoField.uint16("echonetlite.classlist.class", "Class", base.HEX, CLASS_NAMES)
+f.cls_code  = ProtoField.uint16("echonetlite.classlist.class", "Class", base.HEX)
 f.payload   = ProtoField.bytes ("echonetlite.payload", "Arbitrary message")
 
 local ef_short   = ProtoExpert.new("echonetlite.short", "Truncated ECHONET Lite frame",
                                    expert.group.MALFORMED, expert.severity.ERROR)
-local ef_pdc     = ProtoExpert.new("echonetlite.pdc.mismatch", "Unexpected EDT length for this EPC",
+local ef_pdc     = ProtoExpert.new("echonetlite.pdc.mismatch", "EDT does not match the property definition",
                                    expert.group.PROTOCOL, expert.severity.WARN)
 local ef_unk_esv = ProtoExpert.new("echonetlite.esv.unknown", "Unknown ESV",
                                    expert.group.PROTOCOL, expert.severity.WARN)
@@ -591,61 +880,393 @@ local ef_sna     = ProtoExpert.new("echonetlite.sna", "Request not possible (SNA
                                    expert.group.RESPONSE_CODE, expert.severity.NOTE)
 el.experts = { ef_short, ef_pdc, ef_unk_esv, ef_trailing, ef_sna }
 
-el.prefs.udp_port = Pref.uint("UDP port", 3610, "UDP port for ECHONET Lite")
-el.prefs.heuristic = Pref.bool("Heuristic detection on other UDP ports", false,
-    "Try to detect ECHONET Lite frames (EHD1=0x10, EHD2=0x81/0x82) on any UDP port")
+---------------------------------------------------------------------------
+-- Name lookup
+---------------------------------------------------------------------------
 
----------------------------------------------------------------------------
--- Helpers
----------------------------------------------------------------------------
+local function release_index(r)
+    if r == nil or r == "latest" then return 99 end
+    local i = RELEASES:find(r, 1, true)
+    return i or 99
+end
+
+local function selected_release()
+    local i = el.prefs.release
+    if i == nil or i == 0 then return 99 end
+    return i
+end
 
 local function class_name(cls)
-    return CLASS_NAMES[cls] or "Unknown class"
+    local c = MRA and MRA.classes[cls]
+    if c then return L(c) end
+    local x = BUILTIN_CLASS_NAMES[cls]
+    if x then return L(x) end
+    return T("unknown_class")
 end
 
 local function eoj_string(v)
-    local cls = bit.rshift(v, 8)
-    return string.format("%06X (%s #%d)", v, class_name(cls), bit.band(v, 0xFF))
+    return string.format("%06X (%s #%d)", v, class_name(bit.rshift(v, 8)), bit.band(v, 0xFF))
+end
+
+-- Choose the property variant valid for the selected Release.
+-- Returns variant, valid_in_selected_release
+local function pick_variant(list)
+    if not list then return nil end
+    local sel = selected_release()
+    for _, v in ipairs(list) do
+        if release_index(v.from) <= sel and sel <= release_index(v.to) then return v, true end
+    end
+    -- not defined in the selected release: use the newest one
+    local best
+    for _, v in ipairs(list) do
+        if not best or release_index(v.to) > release_index(best.to) then best = v end
+    end
+    return best, false
+end
+
+-- Returns property definition (variant), valid flag
+local function lookup_prop(cls, epc)
+    if not MRA then return nil, false end
+    local c = MRA.classes[cls]
+    if c and c.props[epc] then return pick_variant(c.props[epc]) end
+    if cls ~= 0x0EF0 and MRA.super[epc] then return pick_variant(MRA.super[epc]) end
+    if cls == 0x0EF0 and MRA.super[epc] then return pick_variant(MRA.super[epc]) end
+    return nil, false
 end
 
 local function epc_name(cls, epc)
-    local t = CLASS_EPC_NAMES[cls]
-    if t and t[epc] then return t[epc] end
-    if cls ~= 0x0EF0 and SUPER_EPC_NAMES[epc] then return SUPER_EPC_NAMES[epc] end
-    -- Node profile shares most super class properties
-    if cls == 0x0EF0 and SUPER_EPC_NAMES[epc] then return SUPER_EPC_NAMES[epc] end
-    if epc >= 0xF0 then return "User-defined (manufacturer specific)" end
-    return "Unknown"
+    local v = lookup_prop(cls, epc)
+    if v then return L(v) end
+    if cls == 0x0EF0 and NODE_NAMES[epc] then return L(NODE_NAMES[epc]) end
+    local fb = FALLBACK_EPC_NAMES[cls]
+    if fb and fb[epc] then return fb[epc] end
+    if SUPER_NAMES[epc] then return L(SUPER_NAMES[epc]) end
+    if epc >= 0xF0 then return T("user_epc") end
+    return T("unknown_epc")
 end
 
-local function add_eoj(tree, field, tvbr, label)
-    local v = tvbr:uint()
-    local t = tree:add(field, tvbr)
-    t:set_text(string.format("%s: %s", label, eoj_string(v)))
-    t:add(f.eoj_group, tvbr:range(0, 1))
-    t:add(f.eoj_class, tvbr:range(0, 2))
-    t:add(f.eoj_inst,  tvbr:range(2, 1)):append_text(
-        bit.band(v, 0xFF) == 0 and " (all instances)" or "")
+---------------------------------------------------------------------------
+-- Generic EDT decoder driven by the MRA data definitions
+---------------------------------------------------------------------------
+
+local FMT_SIZE = { int8 = 1, uint8 = 1, int16 = 2, uint16 = 2, int32 = 4, uint32 = 4 }
+
+local function resolve(def, depth)
+    depth = depth or 0
+    if type(def) ~= "table" then return {} end
+    local ref = def["$ref"]
+    if ref and depth < 10 then
+        ref = ref:match("([^/]+)$") or ref
+        local base = resolve(MRA and MRA.defs[ref], depth + 1)
+        local m = {}
+        for k, v in pairs(base) do m[k] = v end
+        for k, v in pairs(def) do if k ~= "$ref" then m[k] = v end end
+        return m
+    end
+    return def
+end
+
+local function num_format(d)
+    if d.format then return d.format end
+    local lo, hi = d.minimum or 0, d.maximum or 255
+    local signed = lo < 0
+    if signed then
+        if lo >= -128 and hi <= 127 then return "int8" end
+        if lo >= -32768 and hi <= 32767 then return "int16" end
+        return "int32"
+    end
+    if hi <= 0xFF then return "uint8" end
+    if hi <= 0xFFFF then return "uint16" end
+    return "uint32"
+end
+
+local def_size
+def_size = function(def, depth)
+    depth = (depth or 0) + 1
+    if depth > 20 then return nil end
+    local d = resolve(def)
+    if d.oneOf then
+        for _, a in ipairs(d.oneOf) do
+            local s = def_size(a, depth)
+            if s then return s end
+        end
+        return nil
+    end
+    local t = d.type
+    if t == "number" then return FMT_SIZE[num_format(d)] or 1
+    elseif t == "state" or t == "numericValue" or t == "bitmap" then return d.size or 1
+    elseif t == "level" then return 1
+    elseif t == "date-time" then return d.size or 7
+    elseif t == "date" then return d.size or 4
+    elseif t == "time" then return d.size or 3
+    elseif t == "raw" then
+        if d.minSize and d.minSize == d.maxSize then return d.minSize end
+        return nil
+    elseif t == "object" then
+        local s = 0
+        for _, p in ipairs(d.properties or {}) do
+            local e = def_size(p.element, depth)
+            if not e then return nil end
+            s = s + e
+        end
+        return s
+    elseif t == "array" then
+        local isz = d.itemSize or def_size(d.items, depth)
+        if isz and d.minItems and d.minItems == d.maxItems then return isz * d.maxItems end
+        return nil
+    end
+    return nil
+end
+
+local function to_signed(v, bytes)
+    local lim = 2 ^ (bytes * 8 - 1)
+    if v >= lim then return v - 2 ^ (bytes * 8) end
     return v
 end
 
-local function signed(v, bits)
-    local lim = 2 ^ (bits - 1)
-    if v >= lim then return v - 2 ^ bits end
-    return v
+local function fmt_number(v)
+    if v == math.floor(v) and math.abs(v) < 1e15 then return string.format("%d", v) end
+    local s = string.format("%.4f", v):gsub("0+$", ""):gsub("%.$", "")
+    return s
 end
 
--- Decode a property map (EPC 0x9B-0x9F, 0xCE/0xCF of controller)
+local function unit_text(u)
+    if not u then return "" end
+    local n = UNIT_NAMES[u]
+    if n then return " " .. L(n) end
+    return " " .. u
+end
+
+local function state_lookup(d, raw)
+    for _, e in ipairs(d.enum or {}) do
+        if tonumber(e.edt) == raw then return L(e.descriptions) end
+    end
+    return nil
+end
+
+local function hex_of(r)
+    return tostring(r:bytes())
+end
+
+local decode_def
+
+local function overflow_codes(fmt)
+    if fmt == "uint8" then return 0xFF, 0xFE
+    elseif fmt == "uint16" then return 0xFFFF, 0xFFFE
+    elseif fmt == "uint32" then return 0xFFFFFFFF, 0xFFFFFFFE
+    elseif fmt == "int8" then return 0x7F, 0x80
+    elseif fmt == "int16" then return 0x7FFF, 0x8000
+    elseif fmt == "int32" then return 0x7FFFFFFF, 0x80000000
+    end
+end
+
+local suppress_coef = false
+local last_coef = nil
+
+local function decode_number(d, raw, size, fmt)
+    local of, uf = overflow_codes(fmt)
+    if d.overflowCode ~= false and raw == of then return T("overflow") end
+    if d.underflowCode ~= false and raw == uf then return T("underflow") end
+    local v = raw
+    if fmt:sub(1, 1) == "i" then v = to_signed(raw, size) end
+    local scaled = v
+    if d.multiple then scaled = v * d.multiple end
+    local s = fmt_number(scaled) .. unit_text(d.unit)
+    if (d.minimum and v < d.minimum) or (d.maximum and v > d.maximum) then
+        s = s .. " (" .. T("out_of_range") .. ")"
+    end
+    if d.coefficient and #d.coefficient > 0 then
+        local note = " (" .. string.format(T("coefficient"), table.concat(d.coefficient, ", ")) .. ")"
+        if suppress_coef then last_coef = note else s = s .. note end
+    end
+    return s
+end
+
+-- Decode a value that is not backed by bytes (bitmap fields)
+local function decode_scalar(def, value)
+    local d = resolve(def)
+    if d.type == "state" then
+        return state_lookup(d, value) or string.format("%s 0x%X", T("undefined"), value)
+    elseif d.type == "level" then
+        if d.base then return string.format(T("level"), value - tonumber(d.base) + 1) end
+        return string.format(T("level"), value)
+    elseif d.type == "numericValue" then
+        for _, e in ipairs(d.enum or {}) do
+            if tonumber(e.edt) == value then return fmt_number(e.numericValue) end
+        end
+    elseif d.type == "number" then
+        local v = value
+        if d.multiple then v = v * d.multiple end
+        return fmt_number(v) .. unit_text(d.unit)
+    end
+    return string.format("0x%X", value)
+end
+
+local function choose_alternative(d, edt, off, avail)
+    local size = def_size(d) or avail
+    local raw
+    if size >= 1 and size <= 4 and size <= avail then raw = edt:range(off, size):uint() end
+    -- 1. a state whose enum matches the raw value (special codes such as "no data")
+    for _, alt in ipairs(d.oneOf) do
+        local a = resolve(alt)
+        if a.type == "state" and raw and state_lookup(a, raw) then return a end
+    end
+    -- 2. a number within range
+    for _, alt in ipairs(d.oneOf) do
+        local a = resolve(alt)
+        if a.type == "number" and raw then
+            local fmt = num_format(a)
+            local sz = FMT_SIZE[fmt] or 1
+            local v = raw
+            if fmt:sub(1, 1) == "i" then v = to_signed(raw, sz) end
+            if (not a.minimum or v >= a.minimum) and (not a.maximum or v <= a.maximum) then return a end
+        end
+    end
+    -- 3. anything that is not a state / number
+    for _, alt in ipairs(d.oneOf) do
+        local a = resolve(alt)
+        if a.type ~= "state" and a.type ~= "number" then return a end
+    end
+    return resolve(d.oneOf[1])
+end
+
+-- Returns text, consumed bytes. May add subtree items.
+decode_def = function(def, edt, off, avail, tree, depth)
+    depth = (depth or 0) + 1
+    local d = resolve(def)
+    if depth > 12 or avail <= 0 then return "", 0 end
+    if d.oneOf then
+        return decode_def(choose_alternative(d, edt, off, avail), edt, off, avail, tree, depth)
+    end
+    local t = d.type
+
+    if t == "number" then
+        local fmt = num_format(d)
+        local size = FMT_SIZE[fmt] or 1
+        if avail < size then return hex_of(edt:range(off, avail)), avail end
+        return decode_number(d, edt:range(off, size):uint(), size, fmt), size
+
+    elseif t == "state" or t == "numericValue" then
+        local size = math.min(d.size or 1, avail)
+        if size > 4 then return hex_of(edt:range(off, size)), size end
+        local raw = edt:range(off, size):uint()
+        if t == "state" then
+            local s = state_lookup(d, raw)
+            if s then return string.format("%s (0x%0" .. (size * 2) .. "X)", s, raw), size end
+            return string.format("%s 0x%0" .. (size * 2) .. "X", T("undefined"), raw), size
+        end
+        return decode_scalar(d, raw), size
+
+    elseif t == "level" then
+        local raw = edt:range(off, 1):uint()
+        local s = decode_scalar(d, raw)
+        if d.base then
+            local lvl = raw - tonumber(d.base) + 1
+            if lvl < 1 or (d.maximum and lvl > d.maximum) then
+                s = string.format("%s 0x%02X", T("undefined"), raw)
+            end
+        end
+        return s, 1
+
+    elseif t == "bitmap" then
+        local size = math.min(d.size or 1, avail)
+        local parts = {}
+        for _, b in ipairs(d.bitmaps or {}) do
+            local idx = b.position and b.position.index or 0
+            local mask = tonumber((b.position and b.position.bitMask or "0b11111111"):sub(3), 2) or 0xFF
+            if idx < size then
+                local byte = edt:range(off + idx, 1):uint()
+                local shift = 0
+                while shift < 8 and bit.band(mask, bit.lshift(1, shift)) == 0 do shift = shift + 1 end
+                local v = bit.rshift(bit.band(byte, mask), shift)
+                local txt = decode_scalar(b.value or {}, v)
+                local name = L(b.descriptions) or "?"
+                if tree then
+                    tree:add(f.element, edt:range(off + idx, 1), name .. ": " .. txt)
+                        :set_text(name .. ": " .. txt)
+                end
+                parts[#parts + 1] = name .. "=" .. txt
+            end
+        end
+        return table.concat(parts, ", "), size
+
+    elseif t == "date-time" or t == "date" or t == "time" then
+        local size = math.min(def_size(d) or avail, avail)
+        local b = function(i) return edt:range(off + i, 1):uint() end
+        if t == "time" then
+            if size >= 3 then return string.format("%02d:%02d:%02d", b(0), b(1), b(2)), size end
+            if size == 2 then return string.format("%02d:%02d", b(0), b(1)), size end
+        elseif size >= 4 then
+            local y = edt:range(off, 2):uint()
+            if t == "date" then return string.format("%04d-%02d-%02d", y, b(2), b(3)), size end
+            if size >= 7 then
+                return string.format("%04d-%02d-%02d %02d:%02d:%02d", y, b(2), b(3), b(4), b(5), b(6)), size
+            elseif size == 6 then
+                return string.format("%04d-%02d-%02d %02d:%02d", y, b(2), b(3), b(4), b(5)), size
+            end
+        end
+        return hex_of(edt:range(off, size)), size
+
+    elseif t == "object" then
+        local pos, parts = 0, {}
+        for _, p in ipairs(d.properties or {}) do
+            if pos >= avail then break end
+            local esz = def_size(p.element) or (avail - pos)
+            esz = math.min(esz, avail - pos)
+            local name = L(p.elementName) or "?"
+            local sub
+            if tree then sub = tree:add(f.element, edt:range(off + pos, esz), "") end
+            local txt, used = decode_def(p.element, edt, off + pos, esz, sub, depth)
+            if sub then sub:set_text(name .. ": " .. txt) end
+            parts[#parts + 1] = name .. "=" .. txt
+            pos = pos + math.max(used, esz)
+        end
+        return table.concat(parts, ", "), pos
+
+    elseif t == "array" then
+        local isz = d.itemSize or def_size(d.items) or 1
+        local n = math.floor(avail / isz)
+        if d.maxItems and n > d.maxItems then n = d.maxItems end
+        local parts = {}
+        local saved = suppress_coef
+        suppress_coef, last_coef = true, nil
+        for i = 0, n - 1 do
+            local sub
+            if tree then sub = tree:add(f.element, edt:range(off + i * isz, isz), "") end
+            local txt = decode_def(d.items, edt, off + i * isz, isz, sub, depth)
+            if sub then sub:set_text(string.format("[%d] %s", i, txt)) end
+            if #parts < 8 then parts[#parts + 1] = txt elseif #parts == 8 then parts[#parts + 1] = "…" end
+        end
+        suppress_coef = saved
+        local note = last_coef or ""
+        if note ~= "" and tree then tree:append_text(note) end
+        return string.format("[%s]%s", table.concat(parts, ", "), note), n * isz
+
+    else -- raw / unknown
+        local r = edt:range(off, avail)
+        local s = hex_of(r)
+        local str = r:string()
+        if #str > 0 and str:match("^[%g ]+%z*$") then
+            s = s .. ' "' .. str:gsub("%z", "") .. '"'
+        end
+        return s, avail
+    end
+end
+
+---------------------------------------------------------------------------
+-- Special decoders (property maps, instance lists, version information)
+---------------------------------------------------------------------------
+
 local function decode_propmap(tree, edt, cls)
     local n = edt:range(0, 1):uint()
-    tree:add(f.map_count, edt:range(0, 1))
+    tree:add(f.map_count, edt:range(0, 1)):set_text(T("map_count") .. ": " .. n)
     local epcs = {}
     if n < 16 then
         for i = 1, math.min(n, edt:len() - 1) do
             local r = edt:range(i, 1)
             local e = r:uint()
             epcs[#epcs + 1] = e
-            tree:add(f.map_epc, r):append_text(" (" .. epc_name(cls, e) .. ")")
+            tree:add(f.map_epc, r):set_text(string.format("0x%02X: %s", e, epc_name(cls, e)))
         end
     elseif edt:len() >= 17 then
         -- 16-byte bitmap: byte i (0..15), bit b (0..7) => EPC (0x80 + b*0x10 + i)
@@ -655,20 +1276,20 @@ local function decode_propmap(tree, edt, cls)
                 if bit.band(byte, bit.lshift(1, b)) ~= 0 then
                     local e = 0x80 + b * 0x10 + i
                     epcs[#epcs + 1] = e
-                    tree:add(f.map_epc, edt:range(1 + i, 1), e):append_text(
-                        " (" .. epc_name(cls, e) .. ")")
+                    tree:add(f.map_epc, edt:range(1 + i, 1), e):set_text(
+                        string.format("0x%02X: %s", e, epc_name(cls, e)))
                 end
             end
         end
     end
     local parts = {}
     for _, e in ipairs(epcs) do parts[#parts + 1] = string.format("%02X", e) end
-    return string.format("%d properties [%s]", n, table.concat(parts, " "))
+    return string.format(T("nprops"), n) .. " [" .. table.concat(parts, " ") .. "]"
 end
 
 local function decode_instlist(tree, edt)
     local n = edt:range(0, 1):uint()
-    tree:add(f.inst_count, edt:range(0, 1))
+    tree:add(f.inst_count, edt:range(0, 1)):set_text(T("inst_count") .. ": " .. n)
     local parts = {}
     local i = 1
     while i + 2 < edt:len() and #parts < n do
@@ -678,30 +1299,65 @@ local function decode_instlist(tree, edt)
         parts[#parts + 1] = string.format("%06X", v)
         i = i + 3
     end
-    return string.format("%d instances [%s]", n, table.concat(parts, " "))
+    return string.format(T("ninst"), n) .. " [" .. table.concat(parts, " ") .. "]"
 end
 
 local function decode_classlist(tree, edt)
     local n = edt:range(0, 1):uint()
-    tree:add(f.cls_count, edt:range(0, 1))
+    tree:add(f.cls_count, edt:range(0, 1)):set_text(T("class_count") .. ": " .. n)
     local parts = {}
     local i = 1
     while i + 1 < edt:len() and #parts < n do
         local r = edt:range(i, 2)
-        tree:add(f.cls_code, r)
-        parts[#parts + 1] = string.format("%04X", r:uint())
+        local c = r:uint()
+        tree:add(f.cls_code, r):set_text(string.format("Class: %04X (%s)", c, class_name(c)))
+        parts[#parts + 1] = string.format("%04X", c)
         i = i + 2
     end
-    return string.format("%d classes [%s]", n, table.concat(parts, " "))
+    return string.format(T("nclass"), n) .. " [" .. table.concat(parts, " ") .. "]"
 end
 
-local function hexstr(edt)
-    return tostring(edt:bytes())
+-- Returns text or nil (nil = use the generic MRA decoder)
+local function decode_special(tree, cls, epc, edt)
+    local len = edt:len()
+    if epc >= 0x9B and epc <= 0x9F then return decode_propmap(tree, edt, cls) end
+    if cls == 0x0EF0 then
+        if epc == 0xD5 or epc == 0xD6 then return decode_instlist(tree, edt) end
+        if epc == 0xD7 then return decode_classlist(tree, edt) end
+        if (epc == 0xD3 and len == 3) or (epc == 0xD4 and len == 2) then
+            return string.format(epc == 0xD3 and T("ninst") or T("nclass"), edt:uint())
+        end
+        if epc == 0x82 and len == 4 then
+            local fmt = edt:range(2, 1):uint()
+            local names = { [1] = T("fmt1"), [2] = T("fmt2"), [3] = T("fmt3") }
+            return string.format(T("version_np"), edt:range(0, 1):uint(), edt:range(1, 1):uint(),
+                                 names[fmt] or string.format("0x%02X", fmt))
+        end
+    end
+    if epc == 0x82 and len == 4 and cls ~= 0x0EF0 then
+        local rel = edt:range(2, 1):uint()
+        if rel >= 0x41 and rel <= 0x5A then
+            return string.format(T("appendix_rel"), string.char(rel), edt:range(3, 1):uint())
+        end
+    end
+    if epc == 0x81 and len == 1 then
+        local v = edt:uint()
+        if v ~= 0x00 and v ~= 0x01 and v ~= 0xFF and bit.band(v, 0x80) == 0 then
+            local loc = LOCATION_NAMES[bit.rshift(v, 3)]
+            if loc then return string.format("%s #%d (0x%02X)", L(loc), bit.band(v, 0x07), v) end
+        end
+    end
+    return nil
 end
 
--- Returns a human readable string for the EDT, or nil.
--- May add subtrees for structured values.
-local function decode_value(tree, cls, epc, edt, pinfo)
+-- Value decoding used when the MRA is not installed (built-in, common properties only)
+local function signed(v, bits)
+    local lim = 2 ^ (bits - 1)
+    if v >= lim then return v - 2 ^ bits end
+    return v
+end
+
+local function fallback_value(tree, cls, epc, edt)
     local len = edt:len()
     if len == 0 then return nil end
     local u = function() return edt:uint() end
@@ -739,7 +1395,7 @@ local function decode_value(tree, cls, epc, edt, pinfo)
         if v == 0x01 then return "Position information" end
         if bit.band(v, 0x80) ~= 0 then return string.format("Free definition (0x%02X)", v) end
         local loc = bit.rshift(v, 3)
-        return string.format("%s #%d", LOCATION_NAMES[loc] or "Reserved", bit.band(v, 0x07))
+        return string.format("%s #%d", L(LOCATION_NAMES[loc]) or "Reserved", bit.band(v, 0x07))
     elseif epc == 0x82 and len == 4 and cls ~= 0x0EF0 then
         local rel = edt:range(2, 1):uint()
         local revision = edt:range(3, 1):uint()
@@ -879,8 +1535,7 @@ end
 -- Property list
 ---------------------------------------------------------------------------
 
--- Dissect `count` properties starting at offset. Returns new offset, list of EPC strings.
-local function dissect_props(tvb, pinfo, tree, offset, count, cls, label)
+local function dissect_props(tvb, pinfo, tree, offset, count, cls, label_key)
     local epcs = {}
     for i = 1, count do
         if offset + 2 > tvb:len() then
@@ -891,11 +1546,26 @@ local function dissect_props(tvb, pinfo, tree, offset, count, cls, label)
         local epc = tvb:range(offset, 1):uint()
         local pdc = tvb:range(offset + 1, 1):uint()
         local avail = math.min(pdc, tvb:len() - offset - 2)
-        local name = epc_name(cls, epc)
+        local variant, valid = lookup_prop(cls, epc)
+        local name = variant and L(variant) or epc_name(cls, epc)
         local pt = tree:add(f.prop, tvb:range(offset, 2 + avail))
-        pt:set_text(string.format("%sProperty #%d: EPC 0x%02X (%s), PDC %d",
-            label and (label .. " ") or "", i, epc, name, pdc))
+        local head = string.format("%s #%d: EPC 0x%02X %s, PDC %d", T(label_key), i, epc, name, pdc)
+        pt:set_text(head)
         pt:add(f.epc, tvb:range(offset, 1)):append_text(" (" .. name .. ")")
+        pt:add(f.epc_name, tvb:range(offset, 1), name):set_text(T("property") .. ": " .. name)
+        if variant then
+            local rel
+            if variant.to == "latest" then
+                rel = string.format(T("release_from"), variant.from)
+            else
+                rel = string.format(T("release_range"), variant.from, variant.to)
+            end
+            if not valid then
+                local sel = selected_release()
+                rel = rel .. string.format(T("not_in_rel"), RELEASES:sub(sel, sel))
+            end
+            pt:add(f.defrel, tvb:range(offset, 1), rel):set_text(T("definition") .. ": " .. rel)
+        end
         pt:add(f.pdc, tvb:range(offset + 1, 1))
         epcs[#epcs + 1] = string.format("%02X", epc)
         if pdc > 0 then
@@ -906,9 +1576,23 @@ local function dissect_props(tvb, pinfo, tree, offset, count, cls, label)
             if avail > 0 then
                 local edt = tvb:range(offset + 2, avail)
                 local et = pt:add(f.edt, edt)
-                local ok, val = pcall(decode_value, et, cls, epc, edt, pinfo)
-                if ok and val then
-                    et:add(f.value, edt, val)
+                local ok, val = pcall(decode_special, et, cls, epc, edt)
+                if ok and val == nil and not variant then
+                    ok, val = pcall(fallback_value, et, cls, epc, edt)
+                end
+                if ok and val == nil and variant then
+                    ok, val = pcall(function()
+                        local txt, used = decode_def(variant.data, edt, 0, avail, et, 0)
+                        local need = def_size(variant.data)
+                        if need and need ~= avail then
+                            et:add_proto_expert_info(ef_pdc, string.format(
+                                "PDC %d, but the definition expects %d bytes", avail, need))
+                        end
+                        return txt
+                    end)
+                end
+                if ok and val and val ~= "" then
+                    et:add(f.value, edt, val):set_text(T("value") .. ": " .. val)
                     pt:append_text(" = " .. val)
                 elseif not ok then
                     et:add_proto_expert_info(ef_pdc, "Could not decode EDT: " .. tostring(val))
@@ -923,6 +1607,21 @@ end
 ---------------------------------------------------------------------------
 -- Main dissector
 ---------------------------------------------------------------------------
+
+local function add_eoj(tree, field, tvbr, label)
+    local v = tvbr:uint()
+    local cls = bit.rshift(v, 8)
+    local t = tree:add(field, tvbr)
+    t:set_text(string.format("%s: %s", label, eoj_string(v)))
+    local grp = bit.rshift(v, 16)
+    t:add(f.eoj_group, tvbr:range(0, 1)):set_text(string.format("Class group code: 0x%02X (%s)",
+        grp, L(CLASS_GROUP_NAMES[grp]) or T("unknown_class")))
+    t:add(f.eoj_class, tvbr:range(0, 2)):set_text(string.format("Class code: 0x%04X (%s)",
+        cls, class_name(cls)))
+    local inst = bit.band(v, 0xFF)
+    t:add(f.eoj_inst, tvbr:range(2, 1)):append_text(inst == 0 and (" (" .. T("all_instances") .. ")") or "")
+    return v
+end
 
 local function looks_like_el(tvb)
     if tvb:len() < 4 then return false end
@@ -940,8 +1639,11 @@ local function dissect(tvb, pinfo, tree)
 
     pinfo.cols.protocol = "ECHONET Lite"
     local root = tree:add(el, tvb:range(0, len))
+    local st = root:add(el, tvb:range(0, 0))
+    st:set_text(MRA and MRA_STATUS or
+        (MRA_STATUS .. " - " .. (ja() and "内蔵の簡易表で表示しています" or "using built-in tables")))
+    st:set_generated()
 
-    local ehd1 = tvb:range(0, 1):uint()
     local ehd2 = tvb:range(1, 1):uint()
     local tid  = tvb:range(2, 2):uint()
     root:add(f.ehd1, tvb:range(0, 1))
@@ -950,14 +1652,14 @@ local function dissect(tvb, pinfo, tree)
 
     if ehd2 == 0x82 then
         if len > 4 then root:add(f.payload, tvb:range(4)) end
-        pinfo.cols.info = string.format("Arbitrary message format, TID=%d, %d bytes", tid, len - 4)
+        pinfo.cols.info = string.format("%s, TID=%d, %d bytes", T("arbitrary"), tid, len - 4)
         root:append_text(string.format(", Format 2, TID: %d", tid))
         return len
     end
 
     if len < 12 then
         root:add_proto_expert_info(ef_short, "Frame shorter than the 12-byte minimum")
-        pinfo.cols.info = string.format("Truncated ECHONET Lite frame, TID=%d", tid)
+        pinfo.cols.info = string.format("%s, TID=%d", T("truncated"), tid)
         return len
     end
 
@@ -968,15 +1670,14 @@ local function dissect(tvb, pinfo, tree)
     local esv = tvb:range(10, 1):uint()
     local esv_item = edata:add(f.esv, tvb:range(10, 1))
     if ESV_DESC[esv] then
-        esv_item:append_text(" - " .. ESV_DESC[esv])
+        esv_item:append_text(" - " .. L(ESV_DESC[esv]))
     else
         esv_item:add_proto_expert_info(ef_unk_esv)
     end
     if esv >= 0x50 and esv <= 0x5F then esv_item:add_proto_expert_info(ef_sna) end
 
-    -- Properties are described in terms of the object that owns them:
-    -- requests (0x6x) and INFC_Res (0x7A) refer to DEOJ,
-    -- other responses/notifications (0x5x/0x7x) come from SEOJ.
+    -- Properties belong to DEOJ for requests (0x6x) and INFC_Res (0x7A),
+    -- and to SEOJ for the other responses / notifications.
     local owner = ((esv >= 0x60 and esv <= 0x6F) or esv == 0x7A) and deoj or seoj
     local cls = bit.rshift(owner, 8)
 
@@ -986,11 +1687,11 @@ local function dissect(tvb, pinfo, tree)
         local opcset = tvb:range(offset, 1):uint()
         edata:add(f.opcset, tvb:range(offset, 1))
         local epcs_set, epcs_get
-        offset, epcs_set = dissect_props(tvb, pinfo, edata, offset + 1, opcset, cls, "Set")
+        offset, epcs_set = dissect_props(tvb, pinfo, edata, offset + 1, opcset, cls, "set_property")
         if offset < len then
             local opcget = tvb:range(offset, 1):uint()
             edata:add(f.opcget, tvb:range(offset, 1))
-            offset, epcs_get = dissect_props(tvb, pinfo, edata, offset + 1, opcget, cls, "Get")
+            offset, epcs_get = dissect_props(tvb, pinfo, edata, offset + 1, opcget, cls, "get_property")
         else
             edata:add_proto_expert_info(ef_short, "OPCGet missing")
             epcs_get = {}
@@ -1001,7 +1702,7 @@ local function dissect(tvb, pinfo, tree)
         local opc = tvb:range(offset, 1):uint()
         edata:add(f.opc, tvb:range(offset, 1))
         local epcs
-        offset, epcs = dissect_props(tvb, pinfo, edata, offset + 1, opc, cls, nil)
+        offset, epcs = dissect_props(tvb, pinfo, edata, offset + 1, opc, cls, "property")
         info_props = "EPC[" .. table.concat(epcs, ",") .. "]"
     end
 
@@ -1029,12 +1730,19 @@ local function heuristic(tvb, pinfo, tree)
     return true
 end
 
+load_mra(el.prefs.mra_dir)
+local loaded_mra_pref = el.prefs.mra_dir
+
 local udp_table = DissectorTable.get("udp.port")
 local current_port = el.prefs.udp_port
 udp_table:add(current_port, el)
 el:register_heuristic("udp", heuristic)
 
 function el.prefs_changed()
+    if loaded_mra_pref ~= el.prefs.mra_dir then
+        loaded_mra_pref = el.prefs.mra_dir
+        load_mra(el.prefs.mra_dir)
+    end
     if current_port ~= el.prefs.udp_port then
         if current_port ~= 0 then udp_table:remove(current_port, el) end
         current_port = el.prefs.udp_port
